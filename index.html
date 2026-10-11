@@ -1,752 +1,158 @@
 
-"use strict";
-
-// AI Cover Studio
-// Frontend: IndexedDB + local RVC backend
-
-const DB_NAME = "ai-cover-studio-v1";
-const STORE = "models";
-const API = "/api";
-
-const $ = (id) => document.getElementById(id);
-
-let db = null;
-let selectedModelId = null;
-let audioFile = null;
-let audioURL = null;
-let resultURL = null;
-let engineReady = false;
-let converting = false;
-
-// ----------------------------
-// STATUS
-// ----------------------------
-
-function setStatus(message, error = false) {
-  const status = $("status");
-  status.textContent = message;
-  status.classList.toggle("error", error);
-}
-
-function formatSize(bytes) {
-  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
-}
-
-function refreshConvertButton() {
-  const button = $("convertButton");
-
-  button.disabled =
-    !engineReady ||
-    !audioFile ||
-    !selectedModelId ||
-    converting;
-
-  button.innerHTML = converting
-    ? "Converting..."
-    : 'Convert vocal <span>↗</span>';
-}
-
-// ----------------------------
-// LOCAL BACKEND
-// ----------------------------
-
-async function checkEngine() {
-  try {
-    const response = await fetch(`${API}/health`, {
-      cache: "no-store",
-      signal: AbortSignal.timeout(5000)
-    });
-
-    if (!response.ok) {
-      throw new Error("Silnik nie odpowiada.");
-    }
-
-    const data = await response.json();
-
-    engineReady = data.ready === true;
-  } catch {
-    engineReady = false;
-  }
-
-  refreshConvertButton();
-  return engineReady;
-}
-
-// ----------------------------
-// INDEXEDDB
-// ----------------------------
-
-function openDB() {
-  return new Promise((resolve, reject) => {
-    if (!window.indexedDB) {
-      reject(new Error("IndexedDB jest niedostępne."));
-      return;
-    }
-
-    const request = indexedDB.open(DB_NAME, 1);
-
-    request.onupgradeneeded = () => {
-      const database = request.result;
-
-      if (!database.objectStoreNames.contains(STORE)) {
-        database.createObjectStore(STORE, {
-          keyPath: "id"
-        });
-      }
-    };
-
-    request.onsuccess = () => resolve(request.result);
-
-    request.onerror = () => reject(
-      request.error || new Error("Nie można otworzyć bazy danych.")
-    );
-
-    request.onblocked = () => reject(
-      new Error("Baza jest zablokowana przez inną kartę.")
-    );
-  });
-}
-
-function transact(mode, operation) {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE, mode);
-    const request = operation(transaction.objectStore(STORE));
-
-    let result;
-
-    request.onsuccess = () => {
-      result = request.result;
-    };
-
-    request.onerror = () => reject(
-      request.error || new Error("Błąd bazy danych.")
-    );
-
-    transaction.oncomplete = () => resolve(result);
-
-    transaction.onerror = () => reject(
-      transaction.error || new Error("Błąd transakcji.")
-    );
-
-    transaction.onabort = () => reject(
-      transaction.error || new Error("Transakcja została przerwana.")
-    );
-  });
-}
-
-const getModels = () =>
-  transact("readonly", store => store.getAll());
-
-const saveModel = record =>
-  transact("readwrite", store => store.put(record));
-
-const deleteModel = id =>
-  transact("readwrite", store => store.delete(id));
-
-const readModel = id =>
-  transact("readonly", store => store.get(id));
-
-// ----------------------------
-// ZIP INSPECTION
-// ----------------------------
-
-// Odczytujemy listę plików z ZIP.
-// Nie wykonujemy żadnego kodu zawartego w archiwum.
-
-function readZipEntries(buffer) {
-  const bytes = new Uint8Array(buffer);
-  const view = new DataView(buffer);
-
-  const u16 = n => view.getUint16(n, true);
-  const u32 = n => view.getUint32(n, true);
-
-  const decoder = new TextDecoder("utf-8");
-
-  let eocd = -1;
-
-  for (
-    let i = bytes.length - 22;
-    i >= Math.max(0, bytes.length - 65557);
-    i--
-  ) {
-    if (
-      u32(i) === 0x06054b50 &&
-      i + 22 + u16(i + 20) <= bytes.length
-    ) {
-      eocd = i;
-      break;
-    }
-  }
-
-  if (eocd < 0) {
-    throw new Error("Nie udało się odczytać pliku ZIP.");
-  }
-
-  const count = u16(eocd + 10);
-  const centralOffset = u32(eocd + 16);
-
-  if (
-    count === 65535 ||
-    centralOffset === 0xffffffff
-  ) {
-    throw new Error("ZIP64 nie jest jeszcze obsługiwany.");
-  }
-
-  const entries = [];
-  let pos = centralOffset;
-
-  for (let i = 0; i < count; i++) {
-    if (
-      pos + 46 > bytes.length ||
-      u32(pos) !== 0x02014b50
-    ) {
-      throw new Error("Uszkodzony spis plików ZIP.");
-    }
-
-    const flags = u16(pos + 8);
-    const method = u16(pos + 10);
-    const compressedSize = u32(pos + 20);
-
-    const nameLength = u16(pos + 28);
-    const extraLength = u16(pos + 30);
-    const commentLength = u16(pos + 32);
-    const offset = u32(pos + 42);
-
-    const end =
-      pos + 46 +
-      nameLength +
-      extraLength +
-      commentLength;
-
-    if (end > bytes.length) {
-      throw new Error("Nieprawidłowe dane ZIP.");
-    }
-
-    const name = decoder.decode(
-      bytes.subarray(
-        pos + 46,
-        pos + 46 + nameLength
-      )
-    );
-
-    entries.push({
-      name,
-      flags,
-      method,
-      compressedSize,
-      offset
-    });
-
-    pos = end;
-  }
-
-  return {
-    entries,
-    bytes,
-    view
-  };
-}
-
-async function unzipText(zip, entry) {
-  if ((entry.flags & 1) !== 0) {
-    throw new Error("ZIP jest zaszyfrowany.");
-  }
-
-  const {bytes, view} = zip;
-
-  const u16 = n => view.getUint16(n, true);
-  const u32 = n => view.getUint32(n, true);
-
-  const start = entry.offset;
-
-  if (
-    start + 30 > bytes.length ||
-    u32(start) !== 0x04034b50
-  ) {
-    throw new Error("Nieprawidłowy nagłówek ZIP.");
-  }
-
-  const dataStart =
-    start + 30 +
-    u16(start + 26) +
-    u16(start + 28);
-
-  if (
-    dataStart + entry.compressedSize >
-    bytes.length
-  ) {
-    throw new Error("Nieprawidłowa długość ZIP.");
-  }
-
-  const compressed = bytes.slice(
-    dataStart,
-    dataStart + entry.compressedSize
-  );
-
-  if (entry.method === 0) {
-    return new TextDecoder().decode(compressed);
-  }
-
-  if (
-    entry.method === 8 &&
-    typeof DecompressionStream !== "undefined"
-  ) {
-    try {
-      const stream = new Blob([compressed])
-        .stream()
-        .pipeThrough(
-          new DecompressionStream("deflate-raw")
-        );
-
-      return await new Response(stream).text();
-    } catch {
-      throw new Error("Nie można rozpakować metadata.json.");
-    }
-  }
-
-  throw new Error("Nieobsługiwany format kompresji ZIP.");
-}
-
-async function inspectZip(file) {
-  if (file.size > 1024 * 1024 * 1024) {
-    throw new Error("Limit ZIP wynosi 1 GB.");
-  }
-
-  const buffer = await file.arrayBuffer();
-  const zip = readZipEntries(buffer);
-
-  const files = zip.entries.filter(
-    entry => !entry.name.endsWith("/")
-  );
-
-  const pth = files.find(
-    entry => entry.name.toLowerCase().endsWith(".pth")
-  );
-
-  const index = files.find(
-    entry => entry.name.toLowerCase().endsWith(".index")
-  );
-
-  if (!pth) {
-    throw new Error(
-      "Model RVC musi zawierać plik .pth. Modele ONNX nie są jeszcze obsługiwane."
-    );
-  }
-
-  const metadataEntry = files.find(
-    entry =>
-      entry.name.split("/").pop().toLowerCase() ===
-      "metadata.json"
-  );
-
-  let metadata = null;
-  let warning = "";
-
-  if (metadataEntry) {
-    try {
-      metadata = JSON.parse(
-        await unzipText(zip, metadataEntry)
-      );
-    } catch (error) {
-      warning = `Nie odczytano metadata.json: ${error.message}`;
-    }
-  }
-
-  const version =
-    metadata?.torchMetadata?.version ||
-    metadata?.type ||
-    "unknown";
-
-  const sampleRate =
-    metadata?.torchMetadata?.config?.sr ||
-    metadata?.torchMetadata?.extra_info?.sr ||
-    "?";
-
-  return {
-    title: String(
-      metadata?.title ||
-      file.name.replace(/\.zip$/i, "")
-    ).slice(0, 160),
-
-    version,
-    sampleRate,
-    hasIndex: Boolean(index),
-    modelName: pth.name,
-    warning
-  };
-}
-
-// ----------------------------
-// VOICE LIBRARY
-// ----------------------------
-
-async function renderModels() {
-  const list = $("modelsList");
-  list.replaceChildren();
-
-  const models = (await getModels()).sort(
-    (a, b) => b.createdAt - a.createdAt
-  );
-
-  $("modelCount").textContent =
-    `${models.length} ${models.length === 1 ? "model" : "models"}`;
-
-  if (!models.length) {
-    selectedModelId = null;
-
-    const empty = document.createElement("p");
-    empty.className = "empty";
-    empty.textContent = "No models imported yet.";
-
-    list.append(empty);
-    refreshConvertButton();
-    return;
-  }
-
-  if (!models.some(model => model.id === selectedModelId)) {
-    selectedModelId = models[0].id;
-  }
-
-  for (const model of models) {
-    const card = document.createElement("div");
-
-    card.className =
-      "model-card" +
-      (model.id === selectedModelId ? " selected" : "");
-
-    const radio = document.createElement("input");
-    radio.type = "radio";
-    radio.name = "model";
-    radio.checked = model.id === selectedModelId;
-
-    radio.setAttribute(
-      "aria-label",
-      `Wybierz model ${model.title}`
-    );
-
-    radio.addEventListener("change", () => {
-      selectedModelId = model.id;
-      renderModels();
-    });
-
-    const info = document.createElement("div");
-    info.className = "model-info";
-
-    const title = document.createElement("strong");
-    title.textContent = model.title;
-
-    const detail = document.createElement("small");
-
-    detail.textContent =
-      `${model.version} · ${model.sampleRate} · ` +
-      `${formatSize(model.blob.size)} · ` +
-      `index: ${model.hasIndex ? "yes" : "no"}`;
-
-    info.append(title, detail);
-
-    info.addEventListener("click", () => {
-      selectedModelId = model.id;
-      renderModels();
-    });
-
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.className = "remove-model";
-    remove.textContent = "Usuń";
-
-    remove.addEventListener("click", async () => {
-      if (converting) return;
-
-      const confirmed = confirm(
-        `Usunąć model „${model.title}” z biblioteki?\n` +
-        "Oryginalny plik ZIP pozostanie na dysku."
-      );
-
-      if (!confirmed) return;
-
-      try {
-        await deleteModel(model.id);
-
-        if (selectedModelId === model.id) {
-          selectedModelId = null;
-        }
-
-        await renderModels();
-
-        setStatus(`Usunięto model „${model.title}”.`);
-      } catch (error) {
-        setStatus(error.message, true);
-      }
-    });
-
-    card.append(radio, info, remove);
-    list.append(card);
-  }
-
-  refreshConvertButton();
-}
-
-async function importModels(files) {
-  if (!db) {
-    setStatus("Biblioteka jest niedostępna.", true);
-    return;
-  }
-
-  for (const file of files) {
-    try {
-      if (!file.name.toLowerCase().endsWith(".zip")) {
-        throw new Error("Wybierz plik ZIP.");
-      }
-
-      setStatus(`Sprawdzanie modelu „${file.name}”…`);
-
-      const info = await inspectZip(file);
-
-      const record = {
-        id: crypto.randomUUID(),
-        blob: file,
-        filename: file.name,
-        createdAt: Date.now(),
-        ...info
-      };
-
-      await saveModel(record);
-
-      selectedModelId = record.id;
-
-      await renderModels();
-
-      setStatus(
-        `Dodano model „${record.title}”. ${info.warning}`
-      );
-    } catch (error) {
-      setStatus(
-        `Nie udało się dodać „${file.name}”: ${error.message}`,
-        true
-      );
-    }
-  }
-}
-
-// ----------------------------
-// SOURCE AUDIO
-// ----------------------------
-
-function clearResult() {
-  if (resultURL) {
-    URL.revokeObjectURL(resultURL);
-    resultURL = null;
-  }
-
-  $("resultPlayer").removeAttribute("src");
-  $("resultPlayer").load();
-
-  $("downloadResult").removeAttribute("href");
-  $("resultPanel").hidden = true;
-}
-
-function setAudio(file) {
-  if (audioURL) {
-    URL.revokeObjectURL(audioURL);
-  }
-
-  audioFile = file || null;
-
-  audioURL = audioFile
-    ? URL.createObjectURL(audioFile)
-    : null;
-
-  $("audioDetails").hidden = !audioFile;
-
-  $("audioName").textContent = audioFile
-    ? `${audioFile.name} · ${formatSize(audioFile.size)}`
-    : "";
-
-  if (audioURL) {
-    $("audioPlayer").src = audioURL;
-  } else {
-    $("audioPlayer").removeAttribute("src");
-    $("audioPlayer").load();
-  }
-
-  clearResult();
-  refreshConvertButton();
-
-  setStatus(
-    audioFile
-      ? `Wczytano wokal „${audioFile.name}”.`
-      : "Usunięto nagranie."
-  );
-}
-
-// ----------------------------
-// CONVERSION
-// ----------------------------
-
-async function convertVocal() {
-  if (converting) return;
-
-  if (!engineReady) {
-    setStatus(
-      "Silnik RVC nie jest połączony z aplikacją.",
-      true
-    );
-    return;
-  }
-
-  if (!audioFile || !selectedModelId) {
-    setStatus(
-      "Najpierw wybierz nagranie i model.",
-      true
-    );
-    return;
-  }
-
-  converting = true;
-  clearResult();
-  refreshConvertButton();
-
-  try {
-    setStatus("Przygotowywanie plików do konwersji…");
-
-    const model = await readModel(selectedModelId);
-
-    if (!model) {
-      throw new Error(
-        "Nie znaleziono wybranego modelu w bibliotece."
-      );
-    }
-
-    const pitch = Number($("pitch").value);
-
-    const form = new FormData();
-
-    form.append("audio", audioFile, audioFile.name);
-    form.append("model_zip", model.blob, model.filename);
-    form.append("pitch", String(pitch));
-
-    setStatus(
-      `Konwersja modelu „${model.title}” ` +
-      `(pitch ${pitch})… To może chwilę potrwać.`
-    );
-
-    const response = await fetch(`${API}/convert`, {
-      method: "POST",
-      body: form
-    });
-
-    if (!response.ok) {
-      let message = `Błąd konwersji (HTTP ${response.status}).`;
-
-      try {
-        const data = await response.json();
-        message = data.error || data.detail || message;
-      } catch {
-        // Serwer nie zwrócił komunikatu JSON.
-      }
-
-      throw new Error(message);
-    }
-
-    const resultBlob = await response.blob();
-
-    if (!resultBlob.size) {
-      throw new Error("Silnik zwrócił pusty plik audio.");
-    }
-
-    resultURL = URL.createObjectURL(resultBlob);
-
-    $("resultPlayer").src = resultURL;
-    $("resultPanel").hidden = false;
-
-    const download = $("downloadResult");
-    download.href = resultURL;
-
-    const safeName = model.title
-      .replace(/[\\/:*?"<>|]/g, "_")
-      .slice(0, 70);
-
-    download.download =
-      `${safeName}_pitch${pitch}.wav`;
-
-    setStatus(
-      `Konwersja zakończona! ` +
-      `Gotowy plik: ${formatSize(resultBlob.size)}.`
-    );
-  } catch (error) {
-    setStatus(
-      `Nie udało się przekonwertować wokalu: ${error.message}`,
-      true
-    );
-  } finally {
-    converting = false;
-    refreshConvertButton();
-  }
-}
-
-// ----------------------------
-// EVENTS
-// ----------------------------
-
-$("pitch").addEventListener("input", () => {
-  const value = Number($("pitch").value);
-
-  $("pitchValue").textContent =
-    `${value > 0 ? "+" : ""}${value} semitones`;
-});
-
-$("audioInput").addEventListener("change", event => {
-  const file = event.target.files[0];
-
-  if (file) {
-    setAudio(file);
-  }
-});
-
-$("removeAudio").addEventListener("click", () => {
-  $("audioInput").value = "";
-  setAudio(null);
-});
-
-$("modelInput").addEventListener("change", async event => {
-  const files = [...event.target.files];
-
-  await importModels(files);
-
-  event.target.value = "";
-});
-
-$("convertButton").addEventListener(
-  "click",
-  convertVocal
-);
-
-// ----------------------------
-// START STUDIO
-// ----------------------------
-
-(async function boot() {
-  refreshConvertButton();
-
-  try {
-    db = await openDB();
-    await renderModels();
-  } catch (error) {
-    setStatus(
-      `Biblioteka jest niedostępna: ${error.message}`,
-      true
-    );
-    return;
-  }
-
-  const ready = await checkEngine();
-
-  if (ready) {
-    setStatus("AI Cover Studio gotowe do konwersji.");
-  } else {
-    setStatus(
-      "Biblioteka gotowa. Lokalny silnik RVC " +
-      "nie jest jeszcze połączony."
-    );
-  }
-})();
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+
+  <title>AI Cover Studio</title>
+
+  <link rel="stylesheet" href="style.css">
+  <script src="script.js" defer></script>
+</head>
+
+<body>
+  <div class="shell">
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-icon">◈</span>
+        <span>AI COVER <strong>STUDIO</strong></span>
+      </div>
+    </header>
+
+    <main>
+      <div class="workspace">
+
+        <!-- SOURCE VOCAL -->
+        <section class="panel">
+          <div class="panel-top">
+            <span class="num">01</span>
+            <h2>Source vocal</h2>
+          </div>
+
+          <label for="audioInput" class="dropzone">
+            <span class="dropicon">♫</span>
+            <strong>Wybierz swoje nagranie</strong>
+            <span>MP3, WAV, OGG, M4A</span>
+            <span class="choose">Choose audio</span>
+          </label>
+
+          <input
+            id="audioInput"
+            type="file"
+            accept="audio/*,.mp3,.wav,.ogg,.m4a"
+            hidden
+          >
+
+          <div id="audioDetails" class="audio-details" hidden>
+            <div class="fileline">
+              <span id="audioName"></span>
+              <button id="removeAudio" class="text-button" type="button">
+                Usuń
+              </button>
+            </div>
+
+            <audio id="audioPlayer" controls preload="metadata"></audio>
+          </div>
+        </section>
+
+        <!-- VOICE LIBRARY -->
+        <section class="panel">
+          <div class="panel-top">
+            <span class="num">02</span>
+            <h2>Voice library</h2>
+            <span id="modelCount" class="count">0 models</span>
+          </div>
+
+          <label for="modelInput" class="import-model">
+            <span>＋</span>
+            Import model ZIP
+          </label>
+
+          <input
+            id="modelInput"
+            type="file"
+            accept=".zip,application/zip"
+            multiple
+            hidden
+          >
+
+          <div id="modelsList" class="model-list">
+            <p class="empty">No models imported yet.</p>
+          </div>
+
+          <p class="help">
+            Modele zapisane lokalnie w przeglądarce.
+          </p>
+        </section>
+
+        <!-- CONVERSION SETTINGS -->
+        <section class="panel settings-panel">
+          <div class="panel-top">
+            <span class="num">03</span>
+            <h2>Conversion settings</h2>
+          </div>
+
+          <label for="pitch">
+            Pitch shift
+            <output id="pitchValue">0 semitones</output>
+          </label>
+
+          <input
+            id="pitch"
+            type="range"
+            min="-12"
+            max="12"
+            step="1"
+            value="0"
+          >
+
+          <div class="range-end">
+            <span>−12</span>
+            <span>0</span>
+            <span>+12</span>
+          </div>
+
+          <button
+            id="convertButton"
+            class="convert"
+            type="button"
+            disabled
+          >
+            Convert vocal <span>↗</span>
+          </button>
+        </section>
+
+      </div>
+
+      <!-- CONVERTED VOCAL -->
+      <section id="resultPanel" class="panel result-panel" hidden>
+        <div class="panel-top">
+          <span class="num">04</span>
+          <h2>Converted vocal</h2>
+        </div>
+
+        <audio id="resultPlayer" controls preload="metadata"></audio>
+
+        <a
+          id="downloadResult"
+          class="download-result"
+          download="converted-vocal.wav"
+        >
+          Download WAV ↓
+        </a>
+      </section>
+
+      <div id="status" class="status" role="status" aria-live="polite">
+        Studio ready.
+      </div>
+
+    </main>
+
+    <footer>AI COVER STUDIO</footer>
+
+  </div>
+</body>
+</html>
