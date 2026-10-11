@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark" />
+  <title>AI Cover Studio · Private Lab</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-icon">◈</span><span>AI COVER <strong>STUDIO</strong></span></div>
+      <span class="pill">PRIVATE LAB · v0.1</span>
+    </header>
+    <main>
+      <div class="hero"><p class="eyebrow">YOUR VOICE · YOUR WORKSPACE</p><h1>Your voice.<br/><em>New possibilities.</em></h1><p>Importuj swoje nagranie i zapisuj modele RVC lokalnie w przeglądarce. To pierwsza wersja studia — silnik konwersji podłączymy po testach.</p></div>
+      <div class="workspace">
+        <section class="panel">
+          <div class="panel-top"><span class="num">01</span><h2>Source vocal</h2></div>
+          <label for="audioInput" class="dropzone"><span class="dropicon">♫</span><strong>Wybierz swoje nagranie</strong><span>MP3, WAV, OGG, M4A — w zależności od przeglądarki</span><span class="choose">Choose audio</span></label>
+          <input id="audioInput" type="file" accept="audio/*,.mp3,.wav,.ogg,.m4a" hidden />
+          <div class="audio-details" id="audioDetails" hidden><div class="fileline"><span id="audioName"></span><button id="removeAudio" class="text-button" type="button">Usuń</button></div><audio id="audioPlayer" controls preload="metadata"></audio><small>Odtwarzacz prezentuje oryginalne nagranie. Suwak pitchu nie zmienia tutaj odsłuchu.</small></div>
+        </section>
+        <section class="panel">
+          <div class="panel-top"><span class="num">02</span><h2>Voice library</h2><span id="modelCount" class="count">0 models</span></div>
+          <label for="modelInput" class="import-model"><span>＋</span> Importuj model ZIP</label>
+          <input id="modelInput" type="file" accept=".zip,application/zip" multiple hidden />
+          <div id="modelsList" class="model-list"><p class="empty">Twoja biblioteka jest pusta. Dodaj pierwszy ZIP z modelem RVC.</p></div>
+          <p class="help">ZIP-y są przechowywane w IndexedDB tej przeglądarki. Nie są wysyłane do nas ani na GitHub. Nie usuwaj oryginalnych ZIP-ów z dysku.</p>
+        </section>
+        <section class="panel settings-panel">
+          <div class="panel-top"><span class="num">03</span><h2>Conversion settings</h2></div>
+          <label for="pitch">Pitch shift <output id="pitchValue">0 semitones</output></label>
+          <input id="pitch" type="range" min="-12" max="12" step="1" value="0" />
+          <div class="range-end"><span>−12</span><span>0</span><span>+12</span></div>
+          <button class="convert" id="convertButton" disabled type="button">Convert vocal <span>↗</span></button>
+          <p class="notice"><span>●</span> <strong>Silnik RVC jeszcze niepodłączony.</strong> Przycisk pozostaje nieaktywny, dopóki prawdziwa konwersja nie będzie gotowa.</p>
+        </section>
+      </div>
+      <div id="status" class="status" role="status" aria-live="polite">Studio gotowe. Możesz dodać pierwszy model.</div>
+    </main>
+    <footer>AI COVER STUDIO · LOCAL-FIRST PROTOTYPE · v0.1</footer>
+  </div>
+</body>
+</html>
